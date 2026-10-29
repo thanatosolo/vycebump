@@ -1,0 +1,173 @@
+name: Vyce.cloud Auto Renew
+
+on:
+  schedule:
+    # 每 4 小时调度执行一次，及时捕获 24h 冷却期结束的可续期窗口
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # 支持 GitHub 控制台手动一键触发
+    inputs:
+      force:
+        description: "是否强制发起续期请求 (忽略 24h 冷却保护)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vycebump-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    # 单次续期最坏情况约 8 分钟（两次尝试 × 浏览器 120s + 直连 120s）；
+    # 设上限避免异常卡死长期占用 concurrency 队列、拖住后续调度。
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+    - name: Setup Python
+      uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+      with:
+        python-version: '3.12'
+
+    # 核心算法与状态边界自动化测试
+    - name: Run Unit Tests
+      run: python3 -m unittest discover -s tests -v
+
+    # (可选) 代理环境启动 (sing-box 支持全协议)
+    - name: Start Proxy (sing-box)
+      id: proxy
+      env:
+        PROXY_URL: ${{ secrets.PROXY_URL }}
+      run: |
+        if [ -z "$PROXY_URL" ]; then
+          echo "ℹ️ 未配置 PROXY_URL，跳过代理直接外连。"
+          echo "proxy_server=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        SINGBOX_VER="1.11.4"
+        SINGBOX_SHA256="0bb762ef286b36c2016d9107fc1f089be7a75f6d579b33f067d31e696c05927e"
+        echo "⬇️ 安全下载 sing-box v${SINGBOX_VER}..."
+        curl --fail --location --silent --show-error --retry 3 \
+          -o sing-box.tar.gz \
+          "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+
+        echo "${SINGBOX_SHA256}  sing-box.tar.gz" | sha256sum --check --status || {
+          echo "❌ sing-box SHA256 校验和不匹配，终止执行！"
+          exit 1
+        }
+
+        tar -xzf sing-box.tar.gz
+        mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+        chmod 0755 ./sing-box
+        rm -rf sing-box.tar.gz "sing-box-${SINGBOX_VER}-linux-amd64"
+
+        echo "⚙️ 生成 sing-box 配置文件..."
+        python3 proxy_handler.py || {
+          echo "❌ 代理配置文件生成失败！"
+          exit 1
+        }
+
+        echo "🚀 启动 sing-box 代理..."
+        nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+        SINGBOX_PID=$!
+        sleep 4
+
+        # 检查进程是否存活
+        if ! kill -0 "$SINGBOX_PID" 2>/dev/null; then
+          echo "❌ sing-box 启动后异常退出，查看日志:"
+          cat singbox.log || true
+          exit 1
+        fi
+
+        # 验证代理端口连通性 (探测 vyce.cloud，允许任何非 000 响应)
+        HTTP_CODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" -x http://127.0.0.1:8080 https://vyce.cloud/api/servers || echo "000")
+        if [ "$HTTP_CODE" = "000" ]; then
+          echo "❌ sing-box 代理探测失败 (HTTP 000 / 连接超时)，Fail-Closed 终止以防止真实 IP 泄露！"
+          cat singbox.log || true
+          exit 1
+        fi
+
+        echo "✅ sing-box 代理连通正常 (探测响应 HTTP ${HTTP_CODE})！"
+        echo "proxy_server=http://127.0.0.1:8080" >> "$GITHUB_OUTPUT"
+
+    # 续期需要先通过 Bestcap CAPTCHA：由无头 Chrome + Node 求解器完成
+    - name: Verify CAPTCHA Solver Prerequisites
+      env:
+        CAPTCHA_SOLVER: ${{ vars.CAPTCHA_SOLVER || 'auto' }}
+        CHROME_BIN: ${{ vars.CHROME_BIN }}
+      run: |
+        case "$(echo "${CAPTCHA_SOLVER:-auto}" | tr '[:upper:]' '[:lower:]')" in
+          off|false|0|no|disabled)
+            echo "ℹ️ CAPTCHA_SOLVER 已关闭，跳过前置检查。"
+            exit 0
+            ;;
+        esac
+
+        if ! command -v node >/dev/null 2>&1; then
+          echo "❌ 未找到 node，Bestcap CAPTCHA 求解脚本需要 Node 18+。"
+          exit 1
+        fi
+        if ! node -e 'const major = Number(process.versions.node.split(".")[0]); process.exit(major >= 18 ? 0 : 1)'; then
+          echo "❌ Node 版本过低 ($(node -v))，需要 18+。"
+          exit 1
+        fi
+
+        if [ -n "${CHROME_BIN:-}" ]; then
+          CHROME="$CHROME_BIN"
+        else
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+        fi
+        if [ -z "$CHROME" ] || [ ! -x "$CHROME" ]; then
+          echo "❌ 未找到 Chrome/Chromium，无法完成续期 CAPTCHA（可用 vars.CHROME_BIN 指定路径）。"
+          exit 1
+        fi
+        echo "✅ CAPTCHA 前置条件就绪: node $(node -v) / $("$CHROME" --version)"
+
+    # 核心续期运行
+    - name: Run Vyce Renew Script
+      env:
+        VYCE_COOKIE: ${{ secrets.VYCE_COOKIE }}
+        # Cookie 暗槽（Edge 扩展自动推送）：优先抓最新 Cookie 验活后使用，
+        # 失败自动回退 VYCE_COOKIE。口令与地址存仓库密钥，不打印进日志。
+        VYCE_SLOT_URL: ${{ secrets.VYCE_SLOT_URL }}
+        VYCE_SLOT_READ: ${{ secrets.VYCE_SLOT_READ }}
+        # 续期状态上报（clip 状态接口）：续期成功后推一条记录，
+        # 巡检凭它确认 Actions 的续期结果。口令与地址存仓库密钥，不打印进日志。
+        VYCE_STATUS_URL: ${{ secrets.VYCE_STATUS_URL }}
+        VYCE_STATUS_WRITE: ${{ secrets.VYCE_STATUS_WRITE }}
+        VYCE_EXPECTED_LOGIN: thanatosolo
+        USERS_JSON: ${{ secrets.USERS_JSON }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        SMTP_HOST: ${{ secrets.SMTP_HOST }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+        EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        EMAIL_SUBJECT_PREFIX: ${{ secrets.EMAIL_SUBJECT_PREFIX }}
+        ONEMAIL_BASE_URL: ${{ secrets.ONEMAIL_BASE_URL }}
+        ONEMAIL_MODE: ${{ secrets.ONEMAIL_MODE }}
+        ONEMAIL_CREDENTIAL: ${{ secrets.ONEMAIL_CREDENTIAL }}
+        ONEMAIL_FROM_NAME: ${{ secrets.ONEMAIL_FROM_NAME }}
+        FORCE_RENEW: ${{ inputs.force || 'false' }}
+        PROXY_SERVER: ${{ steps.proxy.outputs.proxy_server }}
+        CAPTCHA_SOLVER: ${{ vars.CAPTCHA_SOLVER || 'auto' }}
+        CHROME_BIN: ${{ vars.CHROME_BIN }}
+      run: python3 app.py
+
+    - name: Upload Diagnostic Logs
+      if: failure()
+      uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+      with:
+        name: diagnostic-logs
+        path: singbox.log
+        if-no-files-found: ignore
+        retention-days: 1
